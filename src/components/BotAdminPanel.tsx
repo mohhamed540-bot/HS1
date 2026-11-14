@@ -43,6 +43,7 @@ export interface BotSettings {
   autoRejoinOnKick: boolean;
   kickRejoinDelaySeconds: number;
   autoRepliesEnabled: boolean;
+  smartQaEnabled: boolean;
   welcomeEnabled: boolean;
   delayedReplyEnabled: boolean;
   replyDelaySeconds: number;
@@ -129,6 +130,7 @@ const DEFAULT_SETTINGS_STATE: BotSettings = {
   autoRejoinOnKick: true,
   kickRejoinDelaySeconds: 10,
   autoRepliesEnabled: true,
+  smartQaEnabled: true,
   welcomeEnabled: true,
   delayedReplyEnabled: true,
   replyDelaySeconds: 2,
@@ -530,6 +532,30 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
               />
             </div>
           </div>
+
+          {/* 7. الإجابة الذكية عند ذكر اسم البوت قبل السؤال */}
+          <button
+            type="button"
+            onClick={() => updateSettingsImmediate({ smartQaEnabled: !(settings.smartQaEnabled !== false) })}
+            className={`sm:col-span-2 p-2.5 rounded-xl border flex flex-wrap items-center justify-between gap-2 cursor-pointer transition-all ${
+              settings.smartQaEnabled !== false
+                ? 'bg-teal-950/40 border-teal-500/50 text-teal-200'
+                : 'bg-slate-900 border-slate-700 text-slate-400'
+            }`}
+          >
+            <div className="text-right">
+              <div className="flex items-center gap-2 font-bold">
+                <Sparkles className={`w-4 h-4 ${settings.smartQaEnabled !== false ? 'text-teal-400' : 'text-slate-500'}`} />
+                <span>7. الإجابة الذكية على الأسئلة (عند ذكر اسم البوت قبل السؤال)</span>
+              </div>
+              <div className="text-[10px] text-slate-400 mt-0.5 pr-6">
+                مثال: «سارة قولي لي ما عدد قارات العالم» — يجيب البوت المعني فقط إجابة ذكية وصحيحة
+              </div>
+            </div>
+            <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black shrink-0 ${settings.smartQaEnabled !== false ? 'bg-teal-600 text-white' : 'bg-slate-700 text-slate-300'}`}>
+              {settings.smartQaEnabled !== false ? 'مفعّل' : 'متوقف'}
+            </span>
+          </button>
         </div>
 
         {/* Room Hopping Config */}

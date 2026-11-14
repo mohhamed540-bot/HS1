@@ -3,12 +3,15 @@
  * يعمل كأعضاء حقيقيين في الشات مع مزامنة فورية عبر Socket.IO وحفظ دائم في MongoDB.
  */
 
+import { askBotAI } from './botAi.js';
+
 export const DEFAULT_BOT_SETTINGS = {
   globalEnabled: true,
   autoHopEnabled: false,
   autoRejoinOnKick: true,
   kickRejoinDelaySeconds: 10,
   autoRepliesEnabled: true,
+  smartQaEnabled: true,
   welcomeEnabled: true,
   delayedReplyEnabled: true,
   replyDelaySeconds: 2,
@@ -547,6 +550,91 @@ export function createBotEngine(ctx) {
     return false;
   }
 
+  function extractAddressedBotFromText(rawText, botCandidates) {
+    const trimmed = String(rawText || '').trim();
+    if (!trimmed) return null;
+
+    // Allow optional leading @ or Arabic vocative ("يا " / "ي ") before the bot name
+    const withoutPrefix = trimmed.replace(/^(?:@\s*|يا\s+|ي\s+)+/u, '').trim();
+    if (!withoutPrefix) return null;
+
+    const tokenRegex = /[^\s:،,\-!؟?.~*|"'«»()[\]{}]+/gu;
+    const tokens = [];
+    let m;
+    while ((m = tokenRegex.exec(withoutPrefix)) !== null) {
+      tokens.push({ text: m[0], index: m.index, end: m.index + m[0].length });
+      if (tokens.length >= 8) break;
+    }
+    if (tokens.length === 0) return null;
+
+    // Reject if alphanumeric letters appear before the first extracted token
+    if (/[\p{L}\p{N}]/u.test(withoutPrefix.slice(0, tokens[0].index))) {
+      return null;
+    }
+
+    // Sort bots longest-normalized-name-first so multi-word bot names match before shorter prefixes
+    const orderedBots = [...botCandidates].sort((a, b) => {
+      const lenA = normalizeArabicForMatch(a.botRecord.username).length;
+      const lenB = normalizeArabicForMatch(b.botRecord.username).length;
+      return lenB - lenA;
+    });
+
+    for (const item of orderedBots) {
+      const botNorm = normalizeArabicForMatch(item.botRecord.username);
+      const botCompact = normalizeArabicCompact(item.botRecord.username);
+      if (!botNorm) continue;
+
+      const botWords = botNorm.split(/\s+/).filter(Boolean);
+      const wordCount = botWords.length;
+      if (wordCount === 0 || tokens.length < wordCount) continue;
+
+      const spanText = tokens
+        .slice(0, wordCount)
+        .map((t) => t.text)
+        .join(' ');
+      const spanNorm = normalizeArabicForMatch(spanText);
+      const spanCompact = normalizeArabicCompact(spanText);
+
+      const isMatch =
+        spanNorm === botNorm ||
+        (botCompact.length >= 2 && spanCompact === botCompact);
+
+      if (isMatch) {
+        const endPos = tokens[wordCount - 1].end;
+        const questionText = withoutPrefix
+          .slice(endPos)
+          .replace(/^[\s:،,\-!؟?.~*|"'«»()[\]{}]+/, '')
+          .trim();
+
+        return {
+          botUser: item.botUser,
+          botRecord: item.botRecord,
+          questionText
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function extractAddressedBot(candidates, activeBots) {
+    const enabledBots = [];
+    for (const botUser of activeBots) {
+      const botRecord = bots.find((item) => getBotLiveId(item.id) === botUser.id);
+      if (botRecord && botRecord.enabled) {
+        enabledBots.push({ botUser, botRecord });
+      }
+    }
+    if (enabledBots.length === 0) return null;
+
+    for (const candidate of candidates) {
+      if (!candidate?.raw) continue;
+      const hit = extractAddressedBotFromText(candidate.raw, enabledBots);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
   function onRoomMessage(sender, msg, rawOriginalText = '') {
     if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled) return;
     if (!sender || sender.isBot) return;
@@ -571,15 +659,113 @@ export function createBotEngine(ctx) {
 
     const now = Date.now();
     const lowerSender = sender.username.trim().toLowerCase();
+    const delayMs = botSettings.delayedReplyEnabled ? Math.max(0, Number(botSettings.replyDelaySeconds ?? 2)) * 1000 : 0;
 
+    // 1. Addressed Bot Q&A (Condition: member mentions the bot's name BEFORE the question/statement)
+    const addressed = extractAddressedBot(candidates, activeBots);
+    if (addressed) {
+      const { botUser, botRecord, questionText } = addressed;
+
+      if (!questionText) {
+        const mentionKey = `${botRecord.id}::${lowerSender}::mention`;
+        if (now - (replyCooldowns.get(mentionKey) || 0) >= 10 * 1000) {
+          replyCooldowns.set(mentionKey, now);
+          setTimeout(() => {
+            if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled) return;
+            const liveBot = users.find((u) => u.id === botUser.id && u.room === roomId);
+            if (!liveBot) return;
+            sendBotMessage(liveBot, roomId, `لبيه يا ${sender.username}، أنا هنا! اكتب اسمي متبوعاً بسؤالك وراح أجاوبك 🌹`);
+          }, delayMs);
+        }
+        return;
+      }
+
+      if (botSettings.smartQaEnabled !== false) {
+        // Only prevent accidental double-tap of the exact same question within 1.5s; distinct questions answer without limit
+        const normQuestionKey = normalizeArabicForMatch(questionText) || questionText.toLowerCase();
+        const qaKey = `${botRecord.id}::${lowerSender}::qa::${normQuestionKey}`;
+        if (now - (replyCooldowns.get(qaKey) || 0) < 1500) {
+          return;
+        }
+        replyCooldowns.set(qaKey, now);
+        if (replyCooldowns.size > 500) {
+          for (const [k, ts] of replyCooldowns.entries()) {
+            if (now - ts > 10 * 60 * 1000) replyCooldowns.delete(k);
+          }
+        }
+
+        const roomObj = chatRooms.find((r) => r.id === roomId);
+        const roomName = roomObj?.name || roomId;
+        const startedAt = Date.now();
+
+        (async () => {
+          const aiRes = await askBotAI({
+            bot: botRecord,
+            personalityDescriptor: getPersonalityDescriptor(botRecord.personality),
+            senderName: sender.username,
+            roomName,
+            currentTime: getCurrentTimeString(),
+            questionText
+          });
+
+          const elapsed = Date.now() - startedAt;
+          const remainingDelay = Math.max(0, delayMs - elapsed);
+          if (remainingDelay > 0) {
+            await new Promise((r) => setTimeout(r, remainingDelay));
+          }
+
+          if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled || botSettings.smartQaEnabled === false) {
+            return;
+          }
+          const liveBot = users.find((u) => u.id === botUser.id && u.room === roomId);
+          if (!liveBot) return;
+
+          if (aiRes.ok && aiRes.text) {
+            sendBotMessage(liveBot, roomId, aiRes.text);
+            return;
+          }
+
+          // Fallback to keyword dictionary if AI service is unavailable/unconfigured
+          const qCandidates = [{
+            raw: questionText,
+            lower: questionText.toLowerCase(),
+            norm: normalizeArabicForMatch(questionText),
+            compact: normalizeArabicCompact(questionText)
+          }];
+          const sortedRepliesFallback = [...botReplies]
+            .filter((r) => r && r.keyword && r.keyword.trim())
+            .sort((a, b) => b.keyword.trim().length - a.keyword.trim().length);
+          const fallbackRule = sortedRepliesFallback.find((r) => textMatchesKeyword(qCandidates, r.keyword));
+          if (fallbackRule) {
+            let replyText = formatReplyTemplate(fallbackRule.reply, sender.username, botRecord);
+            const normKw = normalizeArabicForMatch(fallbackRule.keyword);
+            if (normKw === 'كم الساعه' && !fallbackRule.reply.includes('{الوقت الحقيقي}')) {
+              replyText = `${replyText} (${getCurrentTimeString()})`;
+            }
+            sendBotMessage(liveBot, roomId, replyText);
+            return;
+          }
+
+          console.error(`[BotAI] Failed for bot "${botRecord.username}" (${aiRes.errorCode}): ${aiRes.errorMessage}`);
+          const userFacingErr =
+            aiRes.errorCode === 'NO_API_KEY' || aiRes.errorCode === 'API_KEY_INVALID' || aiRes.errorCode === 'PERMISSION_DENIED'
+              ? `عذراً يا ${sender.username}، ميزة الإجابة الذكية تحتاج إلى تفعيل مفتاح Gemini API في إعدادات الخادم (Settings > Secrets).`
+              : `عذراً يا ${sender.username}، تعذر الحصول على إجابة الآن، حاول مرة أخرى بعد قليل 🌹`;
+          sendBotMessage(liveBot, roomId, userFacingErr);
+        })().catch((err) => {
+          console.error('[BotAI] Unhandled async error:', err);
+        });
+        return;
+      }
+    }
+
+    // 2. General Keyword Dictionary ("كلمات البوت")
     // Sort keywords longest-first so "السلام عليكم" matches before "سلام"
     const sortedReplies = [...botReplies]
       .filter((r) => r && r.keyword && r.keyword.trim())
       .sort((a, b) => b.keyword.trim().length - a.keyword.trim().length);
 
     const matchedRule = sortedReplies.find((r) => textMatchesKeyword(candidates, r.keyword));
-
-    const delayMs = botSettings.delayedReplyEnabled ? Math.max(0, Number(botSettings.replyDelaySeconds ?? 2)) * 1000 : 0;
 
     if (matchedRule) {
       const responder = activeBots.find((b) => {
@@ -613,12 +799,32 @@ export function createBotEngine(ctx) {
       return;
     }
 
-    // Smart Mention Detection: if message mentions a bot's name (even ornate/tashkeel) without any keyword in botReplies
+    // 3. Bare Mention Detection (whole-word/phrase boundary so "نورتنا" never false-triggers "نور")
     for (const botUser of activeBots) {
       const botRecord = bots.find((item) => getBotLiveId(item.id) === botUser.id);
       if (!botRecord || !botRecord.enabled) continue;
 
-      if (textMatchesKeyword(candidates, botRecord.username)) {
+      const botNorm = normalizeArabicForMatch(botRecord.username);
+      if (!botNorm) continue;
+      const botWords = botNorm.split(/\s+/).filter(Boolean);
+      const isExactMention = candidates.some((c) => {
+        if (!c?.norm) return false;
+        const msgWords = c.norm.split(/\s+/).filter(Boolean);
+        for (let i = 0; i <= msgWords.length - botWords.length; i++) {
+          let allMatch = true;
+          for (let j = 0; j < botWords.length; j++) {
+            const w = msgWords[i + j].replace(/^@+/, '');
+            if (w !== botWords[j]) {
+              allMatch = false;
+              break;
+            }
+          }
+          if (allMatch) return true;
+        }
+        return false;
+      });
+
+      if (isExactMention) {
         const mentionKey = `${botRecord.id}::${lowerSender}::mention`;
         if (now - (replyCooldowns.get(mentionKey) || 0) < 60 * 1000) {
           continue;
@@ -629,7 +835,7 @@ export function createBotEngine(ctx) {
           if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled) return;
           const liveBot = users.find((u) => u.id === botUser.id && u.room === roomId);
           if (!liveBot) return;
-          sendBotMessage(liveBot, roomId, `هلا فيك يا ${sender.username}، أنا هنا`);
+          sendBotMessage(liveBot, roomId, `هلا فيك يا ${sender.username}، أنا هنا! اذكر اسمي قبل سؤالك وراح أجاوبك 🌹`);
         }, delayMs);
         break;
       }
@@ -873,6 +1079,7 @@ export function createBotEngine(ctx) {
       next.kickRejoinDelaySeconds = Math.max(1, Math.min(3600, Number(partial.kickRejoinDelaySeconds) || 10));
     }
     if (typeof partial.autoRepliesEnabled === 'boolean') next.autoRepliesEnabled = partial.autoRepliesEnabled;
+    if (typeof partial.smartQaEnabled === 'boolean') next.smartQaEnabled = partial.smartQaEnabled;
     if (typeof partial.welcomeEnabled === 'boolean') next.welcomeEnabled = partial.welcomeEnabled;
     if (typeof partial.delayedReplyEnabled === 'boolean') next.delayedReplyEnabled = partial.delayedReplyEnabled;
     if (partial.replyDelaySeconds !== undefined) {
