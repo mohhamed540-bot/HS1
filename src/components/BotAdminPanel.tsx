@@ -31,6 +31,7 @@ export interface BotRecord {
   currentRoom: string;
   personality: BotPersonality;
   note?: string;
+  flag?: string;
   enabled: boolean;
   createdAt?: number;
   updatedAt?: number;
@@ -90,6 +91,38 @@ export const PRESET_BOT_AVATARS: Array<{ id: string; label: string; url: string 
   }
 ];
 
+const BOT_FLAG_OPTIONS: Array<{ flag: string; label: string }> = [
+  { flag: '🇸🇦', label: 'المملكة العربية السعودية' },
+  { flag: '🇾🇪', label: 'الجمهورية اليمنية' },
+  { flag: '🇪🇬', label: 'جمهورية مصر العربية' },
+  { flag: '🇮🇶', label: 'جمهورية العراق' },
+  { flag: '🇸🇾', label: 'الجمهورية العربية السورية' },
+  { flag: '🇦🇪', label: 'الإمارات العربية المتحدة' },
+  { flag: '🇰🇼', label: 'دولة الكويت' },
+  { flag: '🇶🇦', label: 'دولة قطر' },
+  { flag: '🇧🇭', label: 'مملكة البحرين' },
+  { flag: '🇴🇲', label: 'سلطنة عمان' },
+  { flag: '🇯🇴', label: 'المملكة الأردنية الهاشمية' },
+  { flag: '🇱🇧', label: 'الجمهورية اللبنانية' },
+  { flag: '🇵🇸', label: 'دولة فلسطين' },
+  { flag: '🇩🇿', label: 'الجمهورية الجزائرية' },
+  { flag: '🇲🇦', label: 'المملكة المغربية' },
+  { flag: '🇹🇳', label: 'الجمهورية التونسية' },
+  { flag: '🇱🇾', label: 'دولة ليبيا' },
+  { flag: '🇸🇩', label: 'جمهورية السودان' },
+  { flag: '🇲🇷', label: 'موريتانيا' },
+  { flag: '🇸🇴', label: 'الصومال' },
+  { flag: '🇹🇷', label: 'تركيا' },
+  { flag: '🇬🇧', label: 'المملكة المتحدة' },
+  { flag: '🇺🇸', label: 'الولايات المتحدة الأمريكية' },
+  { flag: '🇩🇪', label: 'ألمانيا' },
+  { flag: '🇫🇷', label: 'فرنسا' },
+  { flag: '🇨🇦', label: 'كندا' },
+  { flag: '👑', label: 'تاج ملكي' },
+  { flag: '🦅', label: 'صقر مميز' },
+  { flag: '⭐', label: 'نجمة ذهبية' }
+];
+
 const DEFAULT_SETTINGS_STATE: BotSettings = {
   globalEnabled: true,
   autoHopEnabled: false,
@@ -129,6 +162,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
   const [botStatusQuote, setBotStatusQuote] = useState('أهلاً بكم في شات حسن برو');
   const [botDefaultRoom, setBotDefaultRoom] = useState(roomsList[0]?.id || 'الغرفة العامة');
   const [botPersonality, setBotPersonality] = useState<BotPersonality>('ودود');
+  const [botFlag, setBotFlag] = useState('🇸🇦');
   const [botNote, setBotNote] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [uploadingAvatar, setUploadingAvatar] = useState(false);
@@ -191,6 +225,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
     setBotStatusQuote('أهلاً بكم في شات حسن برو');
     setBotDefaultRoom(roomsList[0]?.id || 'الغرفة العامة');
     setBotPersonality('ودود');
+    setBotFlag('🇸🇦');
     setBotNote('');
     setFormError(null);
     setShowBotForm(true);
@@ -204,6 +239,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
     setBotStatusQuote(bot.statusQuote);
     setBotDefaultRoom(bot.defaultRoom || roomsList[0]?.id || 'الغرفة العامة');
     setBotPersonality(bot.personality || 'ودود');
+    setBotFlag(bot.flag || '🇸🇦');
     setBotNote(bot.note || '');
     setFormError(null);
     setShowBotForm(true);
@@ -255,6 +291,7 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
       statusQuote: botStatusQuote.trim(),
       defaultRoom: botDefaultRoom,
       personality: botPersonality,
+      flag: botFlag.trim() || '🇸🇦',
       note: botNote.trim()
     };
 
@@ -618,7 +655,10 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
                             <span className={`absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border border-slate-950 ${sMeta.dot}`} />
                           </div>
                           <div className="min-w-0">
-                            <div className="font-black text-white truncate max-w-[120px]">{bot.username}</div>
+                            <div className="font-black text-white truncate max-w-[140px] flex items-center gap-1">
+                              <span>{bot.flag || '🇸🇦'}</span>
+                              <span className="truncate">{bot.username}</span>
+                            </div>
                             <div className="text-[10px] text-slate-400 truncate max-w-[140px]">{bot.statusQuote}</div>
                           </div>
                         </div>
@@ -960,21 +1000,56 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
                 />
               </div>
 
-              {/* الغرفة الافتراضية */}
-              <div>
-                <label className="block font-bold text-slate-200 mb-1">الغرفة الافتراضية (إجباري):</label>
-                <select
-                  required
-                  value={botDefaultRoom}
-                  onChange={(e) => setBotDefaultRoom(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white outline-none focus:border-amber-500"
-                >
-                  {roomsList.map((room) => (
-                    <option key={room.id} value={room.id}>
-                      {room.name}
-                    </option>
-                  ))}
-                </select>
+              {/* الغرفة الافتراضية + العلم يدوياً */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-bold text-slate-200 mb-1">الغرفة الافتراضية (إجباري):</label>
+                  <select
+                    required
+                    value={botDefaultRoom}
+                    onChange={(e) => setBotDefaultRoom(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white outline-none focus:border-amber-500"
+                  >
+                    {roomsList.map((room) => (
+                      <option key={room.id} value={room.id}>
+                        {room.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-bold text-slate-200 mb-1">العلم / الدولة (يدوياً):</label>
+                  <div className="flex items-center gap-1.5">
+                    <select
+                      value={BOT_FLAG_OPTIONS.some((c) => c.flag === botFlag) ? botFlag : '__custom__'}
+                      onChange={(e) => {
+                        if (e.target.value !== '__custom__') {
+                          setBotFlag(e.target.value);
+                        }
+                      }}
+                      className="flex-1 min-w-0 px-2.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-white outline-none focus:border-amber-500"
+                    >
+                      {BOT_FLAG_OPTIONS.map((c) => (
+                        <option key={c.flag} value={c.flag}>
+                          {c.flag} {c.label}
+                        </option>
+                      ))}
+                      {!BOT_FLAG_OPTIONS.some((c) => c.flag === botFlag) && (
+                        <option value="__custom__">{botFlag} علم مخصص</option>
+                      )}
+                    </select>
+                    <input
+                      type="text"
+                      maxLength={8}
+                      value={botFlag}
+                      onChange={(e) => setBotFlag(e.target.value)}
+                      placeholder="🇸🇦"
+                      title="يمكنك أيضاً لصق أي علم دولة أو رمز هنا"
+                      className="w-12 px-1.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-center text-sm text-white outline-none focus:border-amber-500 shrink-0"
+                    />
+                  </div>
+                </div>
               </div>
 
               {/* ملاحظة اختيارية */}

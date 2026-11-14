@@ -45,12 +45,28 @@ const DEFAULT_FALLBACK_BOT_AVATAR =
 function normalizeArabicForMatch(text) {
   if (!text) return '';
   return String(text)
+    .normalize('NFKC')
     .trim()
     .toLowerCase()
-    .replace(/[\u064B-\u065F\u0670\u0640]/g, '') // remove diacritics and tatweel
-    .replace(/[أإآ]/g, 'ا')
-    .replace(/ى/g, 'ي')
-    .replace(/ة/g, 'ه');
+    // Strip Arabic diacritics, Quranic annotation marks, zero-width joiners, and tatweel
+    .replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u08D3-\u08FF\u0640\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F]/g, '')
+    // Normalize decorative Arabic / Urdu / Persian letter variants
+    .replace(/[أإآٱٲٳٵ]/g, 'ا')
+    .replace(/[ةہۂۀھە]/g, 'ه')
+    .replace(/[ىيیئېۑ]/g, 'ي')
+    .replace(/[ؤۄۅۆۇۈۉ]/g, 'و')
+    .replace(/[كکڪګ]/g, 'ك')
+    // Strip decorative symbols/punctuation often used inside ornate shortcuts
+    .replace(/[꧁꧂✿❀❁❃❋★☆✦✧•·~*|'`"«»_،؛؟.,!()[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeArabicCompact(text) {
+  const base = normalizeArabicForMatch(text);
+  if (!base) return '';
+  // Collapse 2+ repeated letters (e.g. هلااااا -> هلا) and remove spaces between stretched decorative letters
+  return base.replace(/(.)\1+/g, '$1').replace(/\s+/g, '');
 }
 
 function getPersonalityDescriptor(personality) {
@@ -187,6 +203,50 @@ export function createBotEngine(ctx) {
     }
   }
 
+  function emitBotEnterMessage(bot, roomId) {
+    if (!bot || !roomId || bot.status === 'hidden') return;
+    const entryMessage = {
+      id: `enter-bot-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      room: roomId,
+      username: bot.username,
+      avatarUrl: bot.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
+      nameBannerUrl: '',
+      flag: bot.flag || '🇸🇦',
+      badge: `${roomId} Room | دخل الى`,
+      badgeColor: 'text-amber-400',
+      text: `دخل ${bot.username} إلى ${roomId} أهلاً وسهلاً 🦅`,
+      time: getCurrentTimeString(),
+      timestamp: Date.now()
+    };
+    chatHistory.push(entryMessage);
+    pruneRoomChatHistory(roomId);
+    saveHistory();
+    io.to(roomId).emit('message', entryMessage);
+  }
+
+  function emitBotLeaveMessage(bot, oldRoom, newRoom = null) {
+    if (!bot || !oldRoom || bot.status === 'hidden') return;
+    const leaveMessage = {
+      id: `leave-bot-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      room: oldRoom,
+      username: bot.username,
+      avatarUrl: bot.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
+      nameBannerUrl: '',
+      flag: bot.flag || '🇸🇦',
+      badge: newRoom ? `${newRoom} | انتقل إلى` : 'مغادرة 🚪',
+      badgeColor: 'text-amber-400',
+      text: newRoom
+        ? `غادر ${bot.username} وانتقل إلى غرفة [${newRoom}] 🚪`
+        : `غادر ${bot.username} الغرفة 🚪`,
+      time: getCurrentTimeString(),
+      timestamp: Date.now()
+    };
+    chatHistory.push(leaveMessage);
+    pruneRoomChatHistory(oldRoom);
+    saveHistory();
+    io.to(oldRoom).emit('message', leaveMessage);
+  }
+
   function upsertRegisteredMemberForBot(bot, oldUsername) {
     if (oldUsername && oldUsername.toLowerCase() !== bot.username.toLowerCase()) {
       const oldKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === oldUsername.toLowerCase());
@@ -203,7 +263,7 @@ export function createBotEngine(ctx) {
       ...(prev || {}),
       password: prev?.password || hashPassword(`bot-secret-${bot.id}`),
       role: 'member', // Strict requirement: bot is NEVER guest or system
-      flag: prev?.flag || bot.flag || '🇸🇦',
+      flag: bot.flag || prev?.flag || '🇸🇦',
       statusQuote: bot.statusQuote,
       avatarUrl: bot.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
       likes: prev?.likes ?? 100,
@@ -400,7 +460,9 @@ export function createBotEngine(ctx) {
     roomLastBotHopArrivalAt.set(newRoom, now);
 
     saveBots();
+    emitBotLeaveMessage(bot, oldRoom, newRoom);
     broadcastPresenceForRooms(new Set([oldRoom, newRoom]));
+    emitBotEnterMessage(bot, newRoom);
 
     if (botSettings.autoRepliesEnabled) {
       sendBotMessage(liveBot, newRoom, 'أهلاً، وصلت، منورين 🌹');
@@ -469,20 +531,44 @@ export function createBotEngine(ctx) {
     return result;
   }
 
-  function onRoomMessage(sender, msg) {
+  function textMatchesKeyword(candidates, keyword) {
+    const cleanKw = String(keyword || '').trim();
+    if (!cleanKw) return false;
+    const lowerKw = cleanKw.toLowerCase();
+    const normKw = normalizeArabicForMatch(cleanKw);
+    const compactKw = normalizeArabicCompact(cleanKw);
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (candidate.lower.includes(lowerKw)) return true;
+      if (normKw && candidate.norm.includes(normKw)) return true;
+      if (compactKw && compactKw.length >= 3 && candidate.compact.includes(compactKw)) return true;
+    }
+    return false;
+  }
+
+  function onRoomMessage(sender, msg, rawOriginalText = '') {
     if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled) return;
     if (!sender || sender.isBot) return;
     if (!msg || typeof msg.text !== 'string') return;
 
     const rawText = msg.text.trim();
-    if (!rawText) return;
+    const originalText = typeof rawOriginalText === 'string' ? rawOriginalText.trim() : '';
+    if (!rawText && !originalText) return;
 
     const roomId = sender.room;
     const activeBots = getActiveBotUsersInRoom(roomId);
     if (activeBots.length === 0) return;
 
-    const lowerRaw = rawText.toLowerCase();
-    const normalizedRaw = normalizeArabicForMatch(rawText);
+    const candidates = [rawText, originalText]
+      .filter((t, idx, arr) => Boolean(t) && arr.indexOf(t) === idx)
+      .map((t) => ({
+        raw: t,
+        lower: t.toLowerCase(),
+        norm: normalizeArabicForMatch(t),
+        compact: normalizeArabicCompact(t)
+      }));
+
     const now = Date.now();
     const lowerSender = sender.username.trim().toLowerCase();
 
@@ -491,10 +577,7 @@ export function createBotEngine(ctx) {
       .filter((r) => r && r.keyword && r.keyword.trim())
       .sort((a, b) => b.keyword.trim().length - a.keyword.trim().length);
 
-    let matchedRule = sortedReplies.find((r) => lowerRaw.includes(r.keyword.trim().toLowerCase()));
-    if (!matchedRule) {
-      matchedRule = sortedReplies.find((r) => normalizedRaw.includes(normalizeArabicForMatch(r.keyword)));
-    }
+    const matchedRule = sortedReplies.find((r) => textMatchesKeyword(candidates, r.keyword));
 
     const delayMs = botSettings.delayedReplyEnabled ? Math.max(0, Number(botSettings.replyDelaySeconds ?? 2)) * 1000 : 0;
 
@@ -530,14 +613,12 @@ export function createBotEngine(ctx) {
       return;
     }
 
-    // Smart Mention Detection: if message mentions a bot's name without any keyword in botReplies
+    // Smart Mention Detection: if message mentions a bot's name (even ornate/tashkeel) without any keyword in botReplies
     for (const botUser of activeBots) {
       const botRecord = bots.find((item) => getBotLiveId(item.id) === botUser.id);
       if (!botRecord || !botRecord.enabled) continue;
-      const lowerBotName = botRecord.username.trim().toLowerCase();
-      const normBotName = normalizeArabicForMatch(botRecord.username);
 
-      if ((lowerBotName && lowerRaw.includes(lowerBotName)) || (normBotName && normalizedRaw.includes(normBotName))) {
+      if (textMatchesKeyword(candidates, botRecord.username)) {
         const mentionKey = `${botRecord.id}::${lowerSender}::mention`;
         if (now - (replyCooldowns.get(mentionKey) || 0) < 60 * 1000) {
           continue;
@@ -588,23 +669,7 @@ export function createBotEngine(ctx) {
 
         const liveBot = users.find((u) => u.id === getBotLiveId(latestBot.id));
         if (liveBot && !liveBot.isGhost) {
-          const entryMessage = {
-            id: `enter-bot-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-            room: returnRoom,
-            username: latestBot.username,
-            avatarUrl: latestBot.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
-            nameBannerUrl: '',
-            flag: latestBot.flag || '🇸🇦',
-            badge: `${returnRoom} Room | دخل الى`,
-            badgeColor: 'text-amber-400',
-            text: `دخل ${latestBot.username} إلى ${returnRoom} أهلاً وسهلاً 🦅`,
-            time: getCurrentTimeString(),
-            timestamp: Date.now()
-          };
-          chatHistory.push(entryMessage);
-          pruneRoomChatHistory(returnRoom);
-          saveHistory();
-          io.to(returnRoom).emit('message', entryMessage);
+          emitBotEnterMessage(latestBot, returnRoom);
         }
 
         notifyStateChanged();
@@ -650,6 +715,8 @@ export function createBotEngine(ctx) {
       throw new Error(`يوجد بوت بنفس الاسم [${cleanName}] بالفعل.`);
     }
 
+    const flag = String(payload.flag || '🇸🇦').trim() || '🇸🇦';
+
     const newBot = {
       id: `b-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       username: cleanName,
@@ -660,7 +727,7 @@ export function createBotEngine(ctx) {
       currentRoom: defaultRoom,
       personality,
       note,
-      flag: '🇸🇦',
+      flag,
       enabled: payload.enabled !== false,
       createdAt: Date.now(),
       updatedAt: Date.now()
@@ -671,6 +738,9 @@ export function createBotEngine(ctx) {
     upsertRegisteredMemberForBot(newBot);
     syncBotLiveUser(newBot);
     broadcastPresenceForRooms(new Set([newBot.currentRoom]));
+    if (botSettings.globalEnabled && newBot.enabled) {
+      emitBotEnterMessage(newBot, newBot.currentRoom);
+    }
     notifyStateChanged();
     return newBot;
   }
@@ -687,6 +757,7 @@ export function createBotEngine(ctx) {
     const defaultRoom = resolveValidRoom(payload.defaultRoom ?? prev.defaultRoom);
     const personality = payload.personality ?? prev.personality;
     const note = payload.note !== undefined ? String(payload.note).trim() : (prev.note || '');
+    const flag = payload.flag !== undefined ? (String(payload.flag).trim() || '🇸🇦') : (prev.flag || '🇸🇦');
 
     if (!cleanName || !avatarUrl || !status || !statusQuote || !defaultRoom || !personality) {
       throw new Error('جميع الحقول إجبارية ما عدا الملاحظة.');
@@ -721,6 +792,7 @@ export function createBotEngine(ctx) {
       currentRoom: nextRoom,
       personality,
       note,
+      flag,
       enabled: payload.enabled !== undefined ? Boolean(payload.enabled) : prev.enabled,
       updatedAt: Date.now()
     };
@@ -729,7 +801,13 @@ export function createBotEngine(ctx) {
     saveBots();
     upsertRegisteredMemberForBot(updated, prev.username);
     syncBotLiveUser(updated);
+    if (botSettings.globalEnabled && updated.enabled && oldRoom && updated.currentRoom && oldRoom !== updated.currentRoom) {
+      emitBotLeaveMessage(updated, oldRoom, updated.currentRoom);
+    }
     broadcastPresenceForRooms(new Set([oldRoom, updated.currentRoom]));
+    if (botSettings.globalEnabled && updated.enabled && oldRoom && updated.currentRoom && oldRoom !== updated.currentRoom) {
+      emitBotEnterMessage(updated, updated.currentRoom);
+    }
     notifyStateChanged();
     return updated;
   }
@@ -752,6 +830,9 @@ export function createBotEngine(ctx) {
     }
 
     saveBots();
+    if (botSettings.globalEnabled && removed.enabled) {
+      emitBotLeaveMessage(removed, removed.currentRoom);
+    }
     broadcastPresenceForRooms(new Set(affectedRooms));
     notifyStateChanged();
     return removed;
@@ -761,6 +842,7 @@ export function createBotEngine(ctx) {
     const bot = bots.find((b) => b.id === botId);
     if (!bot) throw new Error('البوت غير موجود.');
 
+    const wasEnabled = Boolean(bot.enabled);
     bot.enabled = typeof nextEnabled === 'boolean' ? nextEnabled : !bot.enabled;
     bot.updatedAt = Date.now();
     if (!bot.enabled) {
@@ -770,12 +852,19 @@ export function createBotEngine(ctx) {
 
     saveBots();
     const { oldRoom, newRoom } = syncBotLiveUser(bot);
+    if (botSettings.globalEnabled && wasEnabled && !bot.enabled) {
+      emitBotLeaveMessage(bot, bot.currentRoom);
+    }
     broadcastPresenceForRooms(new Set([oldRoom, newRoom, bot.currentRoom]));
+    if (botSettings.globalEnabled && !wasEnabled && bot.enabled) {
+      emitBotEnterMessage(bot, bot.currentRoom);
+    }
     notifyStateChanged();
     return bot;
   }
 
   function updateSettings(partial) {
+    const wasGlobalEnabled = Boolean(botSettings.globalEnabled);
     const next = { ...botSettings };
     if (typeof partial.globalEnabled === 'boolean') next.globalEnabled = partial.globalEnabled;
     if (typeof partial.autoHopEnabled === 'boolean') next.autoHopEnabled = partial.autoHopEnabled;
@@ -803,9 +892,19 @@ export function createBotEngine(ctx) {
     saveBotSettings();
 
     if (!botSettings.globalEnabled) {
+      if (wasGlobalEnabled) {
+        for (const bot of bots) {
+          if (bot.enabled) emitBotLeaveMessage(bot, bot.currentRoom);
+        }
+      }
       clearAllTimers();
     }
     syncAllBotsToChat();
+    if (!wasGlobalEnabled && botSettings.globalEnabled) {
+      for (const bot of bots) {
+        if (bot.enabled) emitBotEnterMessage(bot, bot.currentRoom);
+      }
+    }
     notifyStateChanged();
     return botSettings;
   }

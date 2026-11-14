@@ -6947,7 +6947,7 @@ io.on('connection', (socket) => {
     }
 
     io.to(user.room).emit('message', messageObj);
-    botEngine.onRoomMessage(user, messageObj);
+    botEngine.onRoomMessage(user, messageObj, cleanMsg);
     socket.to(user.room).emit('userTyping', {
       userId: user.id,
       username: user.username,

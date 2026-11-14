@@ -5,7 +5,7 @@
   "kickRejoinDelaySeconds": 2,
   "autoRepliesEnabled": true,
   "welcomeEnabled": true,
-  "delayedReplyEnabled": true,
+  "delayedReplyEnabled": false,
   "replyDelaySeconds": 2,
   "hopMode": "random",
   "hopIntervalMinutes": 5,
