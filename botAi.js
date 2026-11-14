@@ -6,8 +6,24 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 const conversationMemory = new Map(); // key: `${botId}::${lowerSender}` -> { updatedAt, turns: [] }
-const MAX_TURNS = 6; // 3 user+model exchanges
+const MAX_TURNS = 10; // 5 user+model exchanges
 const MEMORY_TTL_MS = 20 * 60 * 1000;
+
+export function recordBotTurnInMemory(botId, senderName, userText, botReplyText) {
+  if (!botId || !senderName || !userText || !botReplyText) return;
+  const memKey = `${botId}::${String(senderName).trim().toLowerCase()}`;
+  const existing = conversationMemory.get(memKey);
+  const prev = existing && Array.isArray(existing.turns) ? existing.turns : [];
+  const nextTurns = [
+    ...prev,
+    { role: 'user', parts: [{ text: `${senderName}: ${userText}` }] },
+    { role: 'model', parts: [{ text: botReplyText }] }
+  ].slice(-MAX_TURNS);
+  conversationMemory.set(memKey, {
+    updatedAt: Date.now(),
+    turns: nextTurns
+  });
+}
 
 function getAiClient() {
   const apiKey = String(process.env.GEMINI_API_KEY || '').trim();
@@ -81,9 +97,9 @@ export async function askBotAI({
     `شخصيتك: ${bot.personality} (${personalityDescriptor}).`,
     bot.statusQuote ? `حالتك الكتابية: "${bot.statusQuote}".` : '',
     `الوقت الحالي الآن في الشات: ${currentTime}.`,
-    `العضو "${senderName}" وجه كلامه أو سؤاله لك مباشرة باسمك.`,
+    `العضو "${senderName}" يتحدث معك أو يوجه لك سؤالاً الآن في سياق المحادثة بينكما.`,
     `القواعد الصارمة لإجابتك:`,
-    `1. أجب عن السؤال أو الحديث إجابة صحيحة ودقيقة علمياً ومعرفياً 100% (لا تخترع معلومات أبداً).`,
+    `1. أجب عن السؤال أو الحديث إجابة صحيحة ودقيقة علمياً ومعرفياً 100% (لا تخترع معلومات أبداً)، وإذا كان حديثاً اجتماعياً أو سؤالاً عن حالك ويومك فواصل الحديث بلطف وطبيعية متماشياً مع آخر رد في المحادثة.`,
     `2. اجعل الإجابة واضحة ومباشرة ومختصرة تناسب غرف الشات (من سطر إلى 3 أسطر غالباً إلا إذا طلب العضو شرحاً أطول).`,
     `3. تحدّث باللغة العربية الفصحى السلسة أو بأسلوب لطيف قريب من شخصيتك (وإذا سُئلت بلغة أخرى فأجب بنفس اللغة).`,
     `4. خاطب العضو باسمه (${senderName}) بأسلوب لبق يتماشى مع شخصيتك.`,

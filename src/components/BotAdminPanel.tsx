@@ -546,10 +546,10 @@ export const BotAdminPanel: React.FC<BotAdminPanelProps> = ({
             <div className="text-right">
               <div className="flex items-center gap-2 font-bold">
                 <Sparkles className={`w-4 h-4 ${settings.smartQaEnabled !== false ? 'text-teal-400' : 'text-slate-500'}`} />
-                <span>7. الإجابة الذكية على الأسئلة (عند ذكر اسم البوت قبل السؤال)</span>
+                <span>7. الإجابة الذكية على الأسئلة والحوار المتواصل</span>
               </div>
               <div className="text-[10px] text-slate-400 mt-0.5 pr-6">
-                مثال: «سارة قولي لي ما عدد قارات العالم» — يجيب البوت المعني فقط إجابة ذكية وصحيحة
+                مثال: «كيفك ساره» أو «سارة ما عدد قارات العالم» — ويفهم البوت متابعة الحوار معك تلقائياً
               </div>
             </div>
             <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-black shrink-0 ${settings.smartQaEnabled !== false ? 'bg-teal-600 text-white' : 'bg-slate-700 text-slate-300'}`}>

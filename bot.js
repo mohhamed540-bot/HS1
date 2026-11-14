@@ -3,7 +3,7 @@
  * يعمل كأعضاء حقيقيين في الشات مع مزامنة فورية عبر Socket.IO وحفظ دائم في MongoDB.
  */
 
-import { askBotAI } from './botAi.js';
+import { askBotAI, recordBotTurnInMemory } from './botAi.js';
 
 export const DEFAULT_BOT_SETTINGS = {
   globalEnabled: true,
@@ -118,7 +118,9 @@ export function createBotEngine(ctx) {
   // Cooldown maps
   const roomLastBotHopArrivalAt = new Map(); // roomId -> timestamp (prevent >1 bot hopping to same room within 60s)
   const welcomeCooldowns = new Map(); // `${botId}::${lowerUser}` -> timestamp (5 min)
-  const replyCooldowns = new Map(); // `${botId}::${lowerUser}::${keywordKey}` -> timestamp (1 min)
+  const replyCooldowns = new Map(); // `${botId}::${lowerUser}::${keywordKey}` -> timestamp
+  const activeConversations = new Map(); // `${roomId}::${lowerSender}` -> { botId, updatedAt }
+  const ACTIVE_CONVERSATION_TTL_MS = 3 * 60 * 1000; // 3 minutes follow-up window
 
   let stateChangeListeners = new Set();
 
@@ -251,15 +253,20 @@ export function createBotEngine(ctx) {
   }
 
   function upsertRegisteredMemberForBot(bot, oldUsername) {
-    if (oldUsername && oldUsername.toLowerCase() !== bot.username.toLowerCase()) {
-      const oldKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === oldUsername.toLowerCase());
+    const botUsername = String(bot?.username || bot?.name || '').trim();
+    if (!bot || !botUsername) return;
+    if (!bot.username) bot.username = botUsername;
+
+    const cleanOld = typeof oldUsername === 'string' ? oldUsername.trim() : '';
+    if (cleanOld && cleanOld.toLowerCase() !== botUsername.toLowerCase()) {
+      const oldKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === cleanOld.toLowerCase());
       if (oldKey && registeredMembers[oldKey]?.isBot) {
         delete registeredMembers[oldKey];
       }
     }
 
-    const existingKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === bot.username.toLowerCase());
-    const targetKey = existingKey || bot.username;
+    const existingKey = Object.keys(registeredMembers).find((k) => k.toLowerCase() === botUsername.toLowerCase());
+    const targetKey = existingKey || botUsername;
     const prev = registeredMembers[targetKey];
 
     registeredMembers[targetKey] = {
@@ -267,7 +274,7 @@ export function createBotEngine(ctx) {
       password: prev?.password || hashPassword(`bot-secret-${bot.id}`),
       role: 'member', // Strict requirement: bot is NEVER guest or system
       flag: bot.flag || prev?.flag || '🇸🇦',
-      statusQuote: bot.statusQuote,
+      statusQuote: bot.statusQuote || 'أهلاً بكم في الشات',
       avatarUrl: bot.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
       likes: prev?.likes ?? 100,
       points: prev?.points ?? 500,
@@ -358,11 +365,23 @@ export function createBotEngine(ctx) {
 
   function syncAllBotsToChat() {
     const affectedRooms = new Set();
+    const validLiveIds = new Set(bots.filter((b) => b && b.id && b.username).map((b) => getBotLiveId(b.id)));
+    for (let i = users.length - 1; i >= 0; i--) {
+      if (users[i]?.isBot && !validLiveIds.has(users[i].id)) {
+        if (users[i].room) affectedRooms.add(users[i].room);
+        users.splice(i, 1);
+      }
+    }
     for (const bot of bots) {
-      upsertRegisteredMemberForBot(bot);
-      const { oldRoom, newRoom } = syncBotLiveUser(bot);
-      if (oldRoom) affectedRooms.add(oldRoom);
-      if (newRoom) affectedRooms.add(newRoom);
+      if (!bot || !bot.username) continue;
+      try {
+        upsertRegisteredMemberForBot(bot);
+        const { oldRoom, newRoom } = syncBotLiveUser(bot);
+        if (oldRoom) affectedRooms.add(oldRoom);
+        if (newRoom) affectedRooms.add(newRoom);
+      } catch (err) {
+        console.error(`[BotEngine] Error syncing bot "${bot?.username || bot?.id}":`, err);
+      }
     }
     broadcastPresenceForRooms(affectedRooms);
   }
@@ -550,27 +569,51 @@ export function createBotEngine(ctx) {
     return false;
   }
 
+  function tokenizeWithSpans(text) {
+    const tokenRegex = /[^\s:،,\-!؟?.~*|"'«»()[\]{}@]+/gu;
+    const tokens = [];
+    let m;
+    while ((m = tokenRegex.exec(text)) !== null) {
+      tokens.push({ text: m[0], index: m.index, end: m.index + m[0].length });
+      if (tokens.length >= 40) break;
+    }
+    return tokens;
+  }
+
+  function messageMentionsOtherHumanInRoom(candidates, roomId, senderId) {
+    const otherHumans = users.filter(
+      (u) => u.room === roomId && u.id !== senderId && !u.isBot && !u.isGhost && u.username
+    );
+    if (otherHumans.length === 0) return false;
+
+    for (const human of otherHumans) {
+      const hNorm = normalizeArabicForMatch(human.username);
+      if (!hNorm || hNorm.length < 2) continue;
+      const hWords = hNorm.split(/\s+/).filter(Boolean);
+      for (const c of candidates) {
+        if (!c?.norm) continue;
+        const msgWords = c.norm.split(/\s+/).filter(Boolean);
+        for (let i = 0; i <= msgWords.length - hWords.length; i++) {
+          let ok = true;
+          for (let j = 0; j < hWords.length; j++) {
+            if (msgWords[i + j].replace(/^@+/, '') !== hWords[j]) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function extractAddressedBotFromText(rawText, botCandidates) {
     const trimmed = String(rawText || '').trim();
     if (!trimmed) return null;
 
-    // Allow optional leading @ or Arabic vocative ("يا " / "ي ") before the bot name
-    const withoutPrefix = trimmed.replace(/^(?:@\s*|يا\s+|ي\s+)+/u, '').trim();
-    if (!withoutPrefix) return null;
-
-    const tokenRegex = /[^\s:،,\-!؟?.~*|"'«»()[\]{}]+/gu;
-    const tokens = [];
-    let m;
-    while ((m = tokenRegex.exec(withoutPrefix)) !== null) {
-      tokens.push({ text: m[0], index: m.index, end: m.index + m[0].length });
-      if (tokens.length >= 8) break;
-    }
+    const tokens = tokenizeWithSpans(trimmed);
     if (tokens.length === 0) return null;
-
-    // Reject if alphanumeric letters appear before the first extracted token
-    if (/[\p{L}\p{N}]/u.test(withoutPrefix.slice(0, tokens[0].index))) {
-      return null;
-    }
 
     // Sort bots longest-normalized-name-first so multi-word bot names match before shorter prefixes
     const orderedBots = [...botCandidates].sort((a, b) => {
@@ -579,45 +622,73 @@ export function createBotEngine(ctx) {
       return lenB - lenA;
     });
 
-    for (const item of orderedBots) {
-      const botNorm = normalizeArabicForMatch(item.botRecord.username);
-      const botCompact = normalizeArabicCompact(item.botRecord.username);
-      if (!botNorm) continue;
+    // Pass 1: Match bot name at START (optionally after "@" or "يا" / "ي")
+    // Pass 2: Match bot name ANYWHERE in the sentence with exact whole-word boundaries (e.g. "كيفك ساره", "ما عدد القارات يا سارة؟")
+    for (const pass of ['start', 'anywhere']) {
+      for (const item of orderedBots) {
+        const botNorm = normalizeArabicForMatch(item.botRecord.username);
+        const botCompact = normalizeArabicCompact(item.botRecord.username);
+        if (!botNorm) continue;
 
-      const botWords = botNorm.split(/\s+/).filter(Boolean);
-      const wordCount = botWords.length;
-      if (wordCount === 0 || tokens.length < wordCount) continue;
+        const botWords = botNorm.split(/\s+/).filter(Boolean);
+        const wordCount = botWords.length;
+        if (wordCount === 0 || tokens.length < wordCount) continue;
 
-      const spanText = tokens
-        .slice(0, wordCount)
-        .map((t) => t.text)
-        .join(' ');
-      const spanNorm = normalizeArabicForMatch(spanText);
-      const spanCompact = normalizeArabicCompact(spanText);
+        const maxStartIdx = pass === 'start' ? 1 : tokens.length - wordCount;
+        for (let startIdx = 0; startIdx <= maxStartIdx; startIdx++) {
+          if (pass === 'start' && startIdx === 1) {
+            const firstNorm = normalizeArabicForMatch(tokens[0].text);
+            if (firstNorm !== 'يا' && firstNorm !== 'ي') continue;
+          }
+          if (startIdx + wordCount > tokens.length) continue;
 
-      const isMatch =
-        spanNorm === botNorm ||
-        (botCompact.length >= 2 && spanCompact === botCompact);
+          const spanText = tokens
+            .slice(startIdx, startIdx + wordCount)
+            .map((t) => t.text)
+            .join(' ');
+          const spanNorm = normalizeArabicForMatch(spanText);
+          const spanCompact = normalizeArabicCompact(spanText);
 
-      if (isMatch) {
-        const endPos = tokens[wordCount - 1].end;
-        const questionText = withoutPrefix
-          .slice(endPos)
-          .replace(/^[\s:،,\-!؟?.~*|"'«»()[\]{}]+/, '')
-          .trim();
+          const isMatch =
+            spanNorm === botNorm ||
+            (botCompact.length >= 2 && spanCompact === botCompact);
 
-        return {
-          botUser: item.botUser,
-          botRecord: item.botRecord,
-          questionText
-        };
+          if (isMatch) {
+            // If bot name is at start, strip prefix+botName so questionText is clean;
+            // If bot name is in middle/end (e.g. "كيفك ساره"), keep the full natural sentence so AI sees full intent!
+            let questionText = '';
+            if (pass === 'start') {
+              const endPos = tokens[startIdx + wordCount - 1].end;
+              questionText = trimmed
+                .slice(endPos)
+                .replace(/^[\s:،,\-!؟?.~*|"'«»()[\]{}]+/, '')
+                .trim();
+            } else {
+              const before = trimmed.slice(0, tokens[startIdx].index).trim();
+              const after = trimmed.slice(tokens[startIdx + wordCount - 1].end).trim();
+              const remainingTokens = tokens.length - wordCount;
+              questionText = remainingTokens > 0 ? `${before} ${after}`.trim() : '';
+              // Preserve natural phrasing when non-empty
+              if (questionText) {
+                questionText = trimmed;
+              }
+            }
+
+            return {
+              botUser: item.botUser,
+              botRecord: item.botRecord,
+              questionText,
+              explicitMention: true
+            };
+          }
+        }
       }
     }
 
     return null;
   }
 
-  function extractAddressedBot(candidates, activeBots) {
+  function extractAddressedBot(candidates, activeBots, roomId, sender) {
     const enabledBots = [];
     for (const botUser of activeBots) {
       const botRecord = bots.find((item) => getBotLiveId(item.id) === botUser.id);
@@ -627,11 +698,52 @@ export function createBotEngine(ctx) {
     }
     if (enabledBots.length === 0) return null;
 
+    // 1. Explicit bot name mention (at start, middle, or end of sentence)
     for (const candidate of candidates) {
       if (!candidate?.raw) continue;
       const hit = extractAddressedBotFromText(candidate.raw, enabledBots);
       if (hit) return hit;
     }
+
+    // 2. Active conversation follow-up (e.g. user replied "انا بخير دامك بخير كيف كان يومك" right after talking to Sara)
+    const lowerSender = String(sender?.username || '').trim().toLowerCase();
+    const convKey = `${roomId}::${lowerSender}`;
+    const conv = activeConversations.get(convKey);
+    if (conv) {
+      const now = Date.now();
+      if (now - conv.updatedAt > ACTIVE_CONVERSATION_TTL_MS) {
+        activeConversations.delete(convKey);
+        return null;
+      }
+
+      // If user clearly started talking to another human member in the room, step back and close bot session
+      if (messageMentionsOtherHumanInRoom(candidates, roomId, sender.id)) {
+        activeConversations.delete(convKey);
+        return null;
+      }
+
+      const activeTarget = enabledBots.find((item) => item.botRecord.id === conv.botId);
+      if (!activeTarget) {
+        activeConversations.delete(convKey);
+        return null;
+      }
+
+      // Check if user wants to pause/stop bot talking ("خلاص", "اسكت", "اسكتي")
+      const firstNorm = candidates[0]?.norm || '';
+      if (/^(خلاص|اسكت|اسكتي|توقف|توقفي|بس خلاص)$/u.test(firstNorm)) {
+        activeConversations.delete(convKey);
+        return null;
+      }
+
+      return {
+        botUser: activeTarget.botUser,
+        botRecord: activeTarget.botRecord,
+        questionText: candidates[0]?.raw || '',
+        explicitMention: false,
+        isFollowUp: true
+      };
+    }
+
     return null;
   }
 
@@ -659,22 +771,38 @@ export function createBotEngine(ctx) {
 
     const now = Date.now();
     const lowerSender = sender.username.trim().toLowerCase();
+    const convKey = `${roomId}::${lowerSender}`;
     const delayMs = botSettings.delayedReplyEnabled ? Math.max(0, Number(botSettings.replyDelaySeconds ?? 2)) * 1000 : 0;
 
-    // 1. Addressed Bot Q&A (Condition: member mentions the bot's name BEFORE the question/statement)
-    const addressed = extractAddressedBot(candidates, activeBots);
+    // 1. Addressed Bot Q&A or Active Conversation Follow-Up
+    const addressed = extractAddressedBot(candidates, activeBots, roomId, sender);
     if (addressed) {
-      const { botUser, botRecord, questionText } = addressed;
+      const { botUser, botRecord, questionText, isFollowUp } = addressed;
+      const isFarewell = /(مع السلامه|باي|تصبحون على خير|في امان الله|اشوفك على خير|برب)/u.test(candidates[0]?.norm || '');
+
+      // Keep or update active conversation window (unless saying goodbye)
+      if (isFarewell) {
+        activeConversations.delete(convKey);
+      } else {
+        activeConversations.set(convKey, { botId: botRecord.id, updatedAt: now });
+        if (activeConversations.size > 400) {
+          for (const [k, v] of activeConversations.entries()) {
+            if (now - v.updatedAt > ACTIVE_CONVERSATION_TTL_MS) activeConversations.delete(k);
+          }
+        }
+      }
 
       if (!questionText) {
         const mentionKey = `${botRecord.id}::${lowerSender}::mention`;
-        if (now - (replyCooldowns.get(mentionKey) || 0) >= 10 * 1000) {
+        if (now - (replyCooldowns.get(mentionKey) || 0) >= 5 * 1000) {
           replyCooldowns.set(mentionKey, now);
+          const replyMsg = `لبيه يا ${sender.username}، أنا هنا! اسألني أو تكلم معي وأنا أرد عليك 🌹`;
+          recordBotTurnInMemory(botRecord.id, sender.username, rawText, replyMsg);
           setTimeout(() => {
             if (!botSettings.globalEnabled || !botSettings.autoRepliesEnabled) return;
             const liveBot = users.find((u) => u.id === botUser.id && u.room === roomId);
             if (!liveBot) return;
-            sendBotMessage(liveBot, roomId, `لبيه يا ${sender.username}، أنا هنا! اكتب اسمي متبوعاً بسؤالك وراح أجاوبك 🌹`);
+            sendBotMessage(liveBot, roomId, replyMsg);
           }, delayMs);
         }
         return;
@@ -721,6 +849,9 @@ export function createBotEngine(ctx) {
           if (!liveBot) return;
 
           if (aiRes.ok && aiRes.text) {
+            if (!isFarewell) {
+              activeConversations.set(convKey, { botId: botRecord.id, updatedAt: Date.now() });
+            }
             sendBotMessage(liveBot, roomId, aiRes.text);
             return;
           }
@@ -742,7 +873,13 @@ export function createBotEngine(ctx) {
             if (normKw === 'كم الساعه' && !fallbackRule.reply.includes('{الوقت الحقيقي}')) {
               replyText = `${replyText} (${getCurrentTimeString()})`;
             }
+            recordBotTurnInMemory(botRecord.id, sender.username, questionText, replyText);
             sendBotMessage(liveBot, roomId, replyText);
+            return;
+          }
+
+          // For follow-up turns without explicit bot mention when AI fails, avoid spamming error notices unless key is missing on explicit address
+          if (isFollowUp) {
             return;
           }
 
@@ -757,6 +894,8 @@ export function createBotEngine(ctx) {
         });
         return;
       }
+
+      // If smartQaEnabled === false but bot name WAS mentioned, still fall through to keyword matching for that bot
     }
 
     // 2. General Keyword Dictionary ("كلمات البوت")
@@ -1177,16 +1316,46 @@ export function createBotEngine(ctx) {
 
       const loadedBots = dataManager.loadSync('bots', null);
       if (Array.isArray(loadedBots)) {
-        bots = loadedBots.map((b) => ({
-          ...b,
-          currentRoom: resolveValidRoom(b.currentRoom || b.defaultRoom),
-          defaultRoom: resolveValidRoom(b.defaultRoom)
-        }));
+        const sanitizedBots = [];
+        let repairedAny = false;
+
+        for (const raw of loadedBots) {
+          if (!raw || typeof raw !== 'object') {
+            repairedAny = true;
+            continue;
+          }
+          const resolvedUsername = String(raw.username || raw.name || '').trim();
+          if (!resolvedUsername) {
+            repairedAny = true;
+            continue;
+          }
+          if (!raw.username || !raw.id) repairedAny = true;
+
+          sanitizedBots.push({
+            ...raw,
+            id: raw.id || `b-legacy-${resolvedUsername.toLowerCase().replace(/\s+/g, '_')}`,
+            username: resolvedUsername,
+            avatarUrl: raw.avatarUrl || DEFAULT_FALLBACK_BOT_AVATAR,
+            status: ['online', 'offline', 'away', 'hidden'].includes(raw.status) ? raw.status : 'online',
+            statusQuote: String(raw.statusQuote || 'أهلاً بكم في الشات').trim(),
+            defaultRoom: resolveValidRoom(raw.defaultRoom || raw.currentRoom),
+            currentRoom: resolveValidRoom(raw.currentRoom || raw.defaultRoom),
+            personality: ['ودود', 'رسمي', 'مرح', 'ذكي'].includes(raw.personality) ? raw.personality : 'ودود',
+            flag: String(raw.flag || '🇸🇦').trim() || '🇸🇦',
+            note: raw.note ? String(raw.note) : '',
+            enabled: raw.enabled !== false
+          });
+        }
+
+        bots = sanitizedBots;
+        if (repairedAny && !isBoot) {
+          saveBots();
+        }
       }
 
       const loadedReplies = dataManager.loadSync('botReplies', null);
       if (Array.isArray(loadedReplies)) {
-        botReplies = loadedReplies;
+        botReplies = loadedReplies.filter((r) => r && typeof r.keyword === 'string' && typeof r.reply === 'string');
       } else if (isBoot || botReplies.length === 0) {
         botReplies = DEFAULT_BOT_REPLIES.map((item) => ({ ...item }));
         saveBotReplies();
